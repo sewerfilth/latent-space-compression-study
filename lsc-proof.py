@@ -156,24 +156,25 @@ def givens_rotation_matrix(dim, i, j, theta, device):
 
 def rotation_from_prime(prime, dim, device):
     # Deterministic, prime-seeded orthonormal rotation via chained Givens
+    # No QR here (Givens are already orthonormal, and products preserve that)
+    cpu_device = torch.device("cpu")
     torch.manual_seed(prime)
-    R = torch.eye(dim, device=device)
+    R = torch.eye(dim, device=cpu_device)
     for _ in range(6):  # 6 pairs as in the whitepaper
-        i = torch.randint(0, dim, (1,)).item()
-        j = torch.randint(0, dim, (1,)).item()
+        i = torch.randint(0, dim, (1,), device=cpu_device).item()
+        j = torch.randint(0, dim, (1,), device=cpu_device).item()
         while j == i:
-            j = torch.randint(0, dim, (1,)).item()
-        theta = torch.rand(1, device=device) * 2 * torch.pi
-        G = givens_rotation_matrix(dim, i, j, theta, device)
+            j = torch.randint(0, dim, (1,), device=cpu_device).item()
+        theta = torch.rand(1, device=cpu_device) * 2 * torch.pi
+        G = givens_rotation_matrix(dim, i, j, theta, cpu_device)
         R = G @ R
-    # Optional re-orthonormalization
-    Q, _ = torch.linalg.qr(R)
-    return Q
+    return R.to(device)
 
 def apply_rotation_to_latent(latent_flat, prime, device):
     # latent_flat: [16, LATENT_DIM]
     R = rotation_from_prime(prime, LATENT_DIM, device)
-    return (latent_flat @ R.T)  # [16, 12]
+    return latent_flat @ R.T
+
 
 # ==========================================
 # 2. TRAINING + VALIDATION WORKERS
