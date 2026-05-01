@@ -17,11 +17,15 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 # ==========================================
-# 1. CORE ARCHITECTURE (LSC-1)
+# 0. GLOBALS / LSC-1 PARAMETERS
 # ==========================================
 LATENT_DIM = 12
 CODEBOOK_SIZE = 8192
+SYNC_WINDOW_CHUNKS = 64  # "Hard Sync" window in chunks
 
+# ==========================================
+# 1. CORE ARCHITECTURE (LSC-1-LIKE)
+# ==========================================
 class SphericalConvCodec(nn.Module):
     def __init__(self):
         super().__init__()
@@ -39,7 +43,7 @@ class SphericalConvCodec(nn.Module):
         )
         self.codebook = nn.Parameter(initial_cb)
 
-        # Decoder: 16 indices -> 1024 approximated bytes
+        # Decoder: 16 latent vectors -> 1024 approximated bytes
         self.pop = nn.Sequential(
             nn.ConvTranspose1d(LATENT_DIM, 32, 4, 4), nn.ReLU(),
             nn.ConvTranspose1d(32, 16, 4, 4), nn.ReLU(),
@@ -47,11 +51,6 @@ class SphericalConvCodec(nn.Module):
         )
 
     def _nearest_codebook_indices(self, flat_latent, chunk_size=4096):
-        """
-        flat_latent: [N, LATENT_DIM]
-        Returns: [N] long tensor of nearest codebook indices.
-        Chunked to avoid huge cdist allocations.
-        """
         device = flat_latent.device
         codebook = self.codebook.to(device)
 
@@ -60,26 +59,22 @@ class SphericalConvCodec(nn.Module):
 
         for start in range(0, N, chunk_size):
             end = min(start + chunk_size, N)
-            sub = flat_latent[start:end]          # [chunk, LATENT_DIM]
-            dist = torch.cdist(sub, codebook)     # [chunk, CODEBOOK_SIZE]
-            idx = torch.argmin(dist, dim=1)       # [chunk]
+            sub = flat_latent[start:end]
+            dist = torch.cdist(sub, codebook)
+            idx = torch.argmin(dist, dim=1)
             all_indices.append(idx)
 
         return torch.cat(all_indices, dim=0)
 
     def forward_train(self, x):
-        """Differentiable path for training."""
         continuous = self.push(x)
         continuous = F.normalize(continuous, p=2, dim=1)
 
-        # Quantization (snapping to codebook)
-        # continuous: [B, LATENT_DIM, 16]
-        flat_latent = continuous.transpose(1, 2).reshape(-1, LATENT_DIM)  # [B*16, LATENT_DIM]
-        indices = self._nearest_codebook_indices(flat_latent)             # [B*16]
+        flat_latent = continuous.transpose(1, 2).reshape(-1, LATENT_DIM)
+        indices = self._nearest_codebook_indices(flat_latent)
 
         quantized = self.codebook[indices].reshape(-1, 16, LATENT_DIM).transpose(1, 2)
 
-        # Straight-Through Estimator
         quantized_ste = continuous + (quantized - continuous).detach()
 
         recon = self.pop(quantized_ste)
@@ -91,6 +86,13 @@ class SphericalConvCodec(nn.Module):
         flat_latent = continuous.transpose(1, 2).reshape(-1, LATENT_DIM)
         indices = self._nearest_codebook_indices(flat_latent)
         return indices
+
+    @torch.no_grad()
+    def encode_to_latent(self, x):
+        # [1,1,1024] -> [16, LATENT_DIM] flattened
+        continuous = F.normalize(self.push(x), p=2, dim=1)
+        flat_latent = continuous.transpose(1, 2).reshape(-1, LATENT_DIM)
+        return flat_latent  # [16, 12] flattened as 16*12 if needed
 
     @torch.no_grad()
     def decode_from_indices(self, indices):
@@ -105,6 +107,73 @@ class SphericalConvCodec(nn.Module):
             .numpy()
             .tobytes()
         )
+
+    @torch.no_grad()
+    def decode_from_latent(self, latent):
+        # latent: [16, LATENT_DIM]
+        quantized = latent.reshape(-1, 16, LATENT_DIM).transpose(1, 2)
+        x = self.pop(quantized)
+        return (
+            (x * 50.0 + 128.0)
+            .clamp(0, 255)
+            .to(torch.uint8)
+            .squeeze()
+            .cpu()
+            .numpy()
+            .tobytes()
+        )
+
+# ==========================================
+# 1.5 PRIME-INDEXED ROTATIONS (LSC-1 STYLE)
+# ==========================================
+def generate_primes(n):
+    primes = []
+    candidate = 2
+    while len(primes) < n:
+        is_prime = True
+        for p in primes:
+            if p * p > candidate:
+                break
+            if candidate % p == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+    return primes
+
+PRIME_CACHE = generate_primes(100000)  # plenty for long streams
+
+def givens_rotation_matrix(dim, i, j, theta, device):
+    R = torch.eye(dim, device=device)
+    c = torch.cos(theta)
+    s = torch.sin(theta)
+    R[i, i] = c
+    R[j, j] = c
+    R[i, j] = -s
+    R[j, i] = s
+    return R
+
+def rotation_from_prime(prime, dim, device):
+    # Deterministic, prime-seeded orthonormal rotation via chained Givens
+    torch.manual_seed(prime)
+    R = torch.eye(dim, device=device)
+    for _ in range(6):  # 6 pairs as in the whitepaper
+        i = torch.randint(0, dim, (1,)).item()
+        j = torch.randint(0, dim, (1,)).item()
+        while j == i:
+            j = torch.randint(0, dim, (1,)).item()
+        theta = torch.rand(1, device=device) * 2 * torch.pi
+        G = givens_rotation_matrix(dim, i, j, theta, device)
+        R = G @ R
+    # Optional re-orthonormalization
+    Q, _ = torch.linalg.qr(R)
+    return Q
+
+def apply_rotation_to_latent(latent_flat, prime, device):
+    # latent_flat: [16, LATENT_DIM]
+    R = rotation_from_prime(prime, LATENT_DIM, device)
+    return (latent_flat @ R.T)  # [16, 12]
 
 # ==========================================
 # 2. TRAINING + VALIDATION WORKERS
@@ -131,9 +200,6 @@ class TrainingWorker(QThread):
             optimizer, mode='min', factor=0.5, patience=3
         )
 
-        # buffer_size ~ how many 1KB chunks per batch
-        # Original formula was too aggressive and caused huge cdist tensors.
-        # This keeps batches modest and stable.
         buffer_size = 256
 
         self.log_stamp.emit(f"--- ROUND START: {datetime.now().strftime('%H:%M:%S')} ---")
@@ -199,10 +265,12 @@ class ValidationWorker(QThread):
         self.codec.eval()
 
         orig_size = os.path.getsize(self.filepath)
-        compressed_size = 12  # header-ish baseline
+        compressed_size = 12  # header baseline
         self.log_stamp.emit("--- VALIDATION START (Physical Dry Run) ---")
 
         with open(self.filepath, 'rb') as f:
+            chunk_index = 0
+            prev_latent = None
             while True:
                 chunk = f.read(1024)
                 if not chunk:
@@ -214,20 +282,41 @@ class ValidationWorker(QThread):
                 ) / 50.0
                 tensor_in = tensor_in.view(1, 1, 1024)
 
-                indices = self.codec.encode_to_indices(tensor_in)
-                approx = self.codec.decode_from_indices(indices)
+                latent = self.codec.encode_to_latent(tensor_in)  # [16,12]
 
-                residual = bytes(a ^ b for a, b in zip(padded, approx))
-                comp_res = zlib.compress(residual, level=9)
+                if chunk_index % SYNC_WINDOW_CHUNKS == 0 or prev_latent is None:
+                    # Anchor: store 16 indices + residual
+                    indices = self.codec.encode_to_indices(tensor_in)
+                    approx = self.codec.decode_from_indices(indices)
+                    residual = bytes(a ^ b for a, b in zip(padded, approx))
+                    comp_res = zlib.compress(residual, level=9)
 
-                # 16 indices * 2 bytes each + 4 bytes length + residual
-                compressed_size += 32 + 4 + len(comp_res)
+                    # flag(1) + 16 indices(32) + res_len(4) + residual
+                    compressed_size += 1 + 32 + 4 + len(comp_res)
+                    prev_latent = latent.detach()
+                else:
+                    # Mutation: prime-indexed rotation + latent remainder + residual
+                    prime = PRIME_CACHE[chunk_index]
+                    pred_latent = apply_rotation_to_latent(prev_latent, prime, self.device)
+                    eps = (latent - pred_latent).clamp(-1.0, 1.0)
+                    eps_q = (eps * 127.0).round().to(torch.int8).cpu().numpy().tobytes()
+                    comp_eps = zlib.compress(eps_q, level=9)
+
+                    approx = self.codec.decode_from_latent(latent)
+                    residual = bytes(a ^ b for a, b in zip(padded, approx))
+                    comp_res = zlib.compress(residual, level=9)
+
+                    # flag(1) + prime(4) + eps_len(4) + eps + res_len(4) + residual
+                    compressed_size += 1 + 4 + 4 + len(comp_eps) + 4 + len(comp_res)
+                    prev_latent = latent.detach()
+
+                chunk_index += 1
 
         real_ratio = orig_size / max(1, compressed_size)
         self.finished.emit(real_ratio)
 
 # ==========================================
-# 3. IO WORKER (EXPORT / IMPORT)
+# 3. IO WORKER (EXPORT / IMPORT) WITH LSC-1
 # ==========================================
 class CodecWorker(QThread):
     progress = pyqtSignal(int)
@@ -257,10 +346,12 @@ class CodecWorker(QThread):
         self.log_stamp.emit(f"Exporting: {os.path.basename(self.out_path)}")
 
         with open(self.in_path, 'rb') as f_in, open(self.out_path, 'wb') as f_out:
-            # Header: magic + original size
+            # Header: magic + original size + sync window
             f_out.write(b'PICO')
             f_out.write(struct.pack('<Q', orig_size))
+            f_out.write(struct.pack('<I', SYNC_WINDOW_CHUNKS))
 
+            prev_latent = None
             for i in range(total_chunks):
                 chunk = f_in.read(1024)
                 if not chunk:
@@ -272,16 +363,43 @@ class CodecWorker(QThread):
                 ) / 50.0
                 t = t.view(1, 1, 1024)
 
-                indices = self.codec.encode_to_indices(t)
-                approx = self.codec.decode_from_indices(indices)
+                latent = self.codec.encode_to_latent(t)  # [16,12]
 
-                residual = bytes(a ^ b for a, b in zip(padded, approx))
-                comp_res = zlib.compress(residual, level=9)
+                if i % SYNC_WINDOW_CHUNKS == 0 or prev_latent is None:
+                    # Anchor record
+                    f_out.write(b'\x01')  # flag: anchor
+                    indices = self.codec.encode_to_indices(t)
+                    approx = self.codec.decode_from_indices(indices)
 
-                # 16 indices (uint16) + residual length (uint32) + residual bytes
-                f_out.write(struct.pack('<16H', *indices.cpu().tolist()))
-                f_out.write(struct.pack('<I', len(comp_res)))
-                f_out.write(comp_res)
+                    residual = bytes(a ^ b for a, b in zip(padded, approx))
+                    comp_res = zlib.compress(residual, level=9)
+
+                    f_out.write(struct.pack('<16H', *indices.cpu().tolist()))
+                    f_out.write(struct.pack('<I', len(comp_res)))
+                    f_out.write(comp_res)
+
+                    prev_latent = latent.detach()
+                else:
+                    # Mutation record
+                    f_out.write(b'\x02')  # flag: mutation
+                    prime = PRIME_CACHE[i]
+                    f_out.write(struct.pack('<I', prime))
+
+                    pred_latent = apply_rotation_to_latent(prev_latent, prime, self.device)
+                    eps = (latent - pred_latent).clamp(-1.0, 1.0)
+                    eps_q = (eps * 127.0).round().to(torch.int8).cpu().numpy().tobytes()
+                    comp_eps = zlib.compress(eps_q, level=9)
+
+                    approx = self.codec.decode_from_latent(latent)
+                    residual = bytes(a ^ b for a, b in zip(padded, approx))
+                    comp_res = zlib.compress(residual, level=9)
+
+                    f_out.write(struct.pack('<I', len(comp_eps)))
+                    f_out.write(comp_eps)
+                    f_out.write(struct.pack('<I', len(comp_res)))
+                    f_out.write(comp_res)
+
+                    prev_latent = latent.detach()
 
                 self.progress.emit(int(((i + 1) / total_chunks) * 100))
 
@@ -294,29 +412,78 @@ class CodecWorker(QThread):
                 return
 
             orig_size = struct.unpack('<Q', f_in.read(8))[0]
-            f_in.seek(0, os.SEEK_END)
-            file_end = f_in.tell()
-            f_in.seek(12)
+            sync_window = struct.unpack('<I', f_in.read(4))[0]
 
-            while f_in.tell() < file_end:
-                idx_data = f_in.read(32)
-                if not idx_data:
+            prev_latent = None
+            chunk_index = 0
+
+            while True:
+                flag = f_in.read(1)
+                if not flag:
                     break
-                indices = torch.tensor(
-                    struct.unpack('<16H', idx_data),
-                    dtype=torch.long,
-                    device=self.device
-                )
-                approx = self.codec.decode_from_indices(indices)
 
-                res_len_data = f_in.read(4)
-                if not res_len_data:
+                if flag == b'\x01':
+                    # Anchor
+                    idx_data = f_in.read(32)
+                    if not idx_data:
+                        break
+                    indices = torch.tensor(
+                        struct.unpack('<16H', idx_data),
+                        dtype=torch.long,
+                        device=self.device
+                    )
+                    approx = self.codec.decode_from_indices(indices)
+
+                    res_len_data = f_in.read(4)
+                    if not res_len_data:
+                        break
+                    res_len = struct.unpack('<I', res_len_data)[0]
+                    residual = zlib.decompress(f_in.read(res_len))
+
+                    restored = bytes(a ^ b for a, b in zip(approx, residual))
+                    f_out.write(restored)
+
+                    # Reconstruct latent from codebook indices
+                    with torch.no_grad():
+                        latent = self.codec.codebook[indices].reshape(-1, LATENT_DIM)
+                        prev_latent = latent.detach()
+
+                elif flag == b'\x02':
+                    # Mutation
+                    prime_data = f_in.read(4)
+                    if not prime_data:
+                        break
+                    prime = struct.unpack('<I', prime_data)[0]
+
+                    eps_len_data = f_in.read(4)
+                    if not eps_len_data:
+                        break
+                    eps_len = struct.unpack('<I', eps_len_data)[0]
+                    eps_q = zlib.decompress(f_in.read(eps_len))
+
+                    res_len_data = f_in.read(4)
+                    if not res_len_data:
+                        break
+                    res_len = struct.unpack('<I', res_len_data)[0]
+                    residual = zlib.decompress(f_in.read(res_len))
+
+                    with torch.no_grad():
+                        pred_latent = apply_rotation_to_latent(prev_latent, prime, self.device)
+                        eps_tensor = torch.frombuffer(
+                            eps_q, dtype=torch.int8
+                        ).to(self.device).view_as(pred_latent)
+                        eps = (eps_tensor.float() / 127.0).clamp(-1.0, 1.0)
+                        latent = (pred_latent + eps).clamp(-1.0, 1.0)
+                        approx = self.codec.decode_from_latent(latent)
+
+                    restored = bytes(a ^ b for a, b in zip(approx, residual))
+                    f_out.write(restored)
+                    prev_latent = latent.detach()
+                else:
+                    self.log_stamp.emit("Unknown record flag, aborting.")
                     break
-                res_len = struct.unpack('<I', res_len_data)[0]
-                residual = zlib.decompress(f_in.read(res_len))
 
-                restored = bytes(a ^ b for a, b in zip(approx, residual))
-                f_out.write(restored)
+                chunk_index += 1
 
             f_out.truncate(orig_size)
 
